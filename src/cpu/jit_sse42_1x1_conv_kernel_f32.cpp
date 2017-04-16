@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2017 Intel Corporation
+* Copyright 2017 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 #include "type_helpers.hpp"
 #include "utils.hpp"
 
-#include "jit_avx2_1x1_conv_kernel_f32.hpp"
+#include "jit_sse42_1x1_conv_kernel_f32.hpp"
 
 #define GET_OFF(field) offsetof(jit_1x1_conv_call_s, field)
 
@@ -33,7 +33,7 @@ using namespace mkldnn::impl::utils;
 
 using namespace Xbyak;
 
-void jit_avx2_1x1_conv_kernel_f32::bcast_loop(int load_loop_blk,
+void jit_sse42_1x1_conv_kernel_f32::bcast_loop(int load_loop_blk,
         char load_loop_tag)
 {
     mov(aux1_reg_bcast_data, reg_bcast_data);
@@ -78,19 +78,19 @@ void jit_avx2_1x1_conv_kernel_f32::bcast_loop(int load_loop_blk,
     }
 }
 
-void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
+void jit_sse42_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
         char load_loop_tag, char bcast_loop_tag)
 {
-    auto vreg_load = [=](int i) {
-        return Ymm(ur * load_loop_blk + i);
+    auto reg_load = [=](int i, int n) {
+        return Xmm(2*ur * load_loop_blk + 2*i + n);
     };
 
-    auto vreg_accum = [=](int i, int j) {
-        return Ymm(j * load_loop_blk + i);
+    auto reg_accum = [=](int i, int j, int n) {
+        return Xmm(2*j * load_loop_blk + 2*i + n);
     };
 
-    auto bias_ptr = [=](int i) {
-        return ptr[reg_bias_data + sizeof(float) * jcp.oc_block * i];
+    auto bias_ptr = [=](int i, int n) {
+        return ptr[reg_bias_data + sizeof(float) * jcp.oc_block * i + n*4*sizeof(float)];
     };
 
     auto bcast_ptr = [=](int u, int j) {
@@ -98,8 +98,7 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
         assert(u <= jcp.reduce_loop_unroll);
         size_t offt;
         if (one_of(jcp.prop_kind,
-                    forward_training, forward_inference, backward_data))
-        {
+                    forward_training, forward_inference, backward_data)) {
             assert(jcp.reduce_loop_unroll == (jcp.prop_kind == backward_data)
                     ? jcp.oc_block : jcp.ic_block);
             auto height = (jcp.prop_kind == backward_data) ? jcp.os : jcp.is;
@@ -111,7 +110,7 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
         return ptr[aux_reg_bcast_data + sizeof(float) * offt];
     };
 
-    auto load_ptr = [=](int u, int i) {
+    auto load_ptr = [=](int u, int i, int n) {
         size_t offt;
         size_t u0 = u % jcp.reduce_loop_unroll;
         size_t u1 = u / jcp.reduce_loop_unroll;
@@ -126,21 +125,21 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
             offt = (i * jcp.ic + u0) * jcp.oc_block;
         }
         return ptr[aux_reg_load_data
-            + u1 * jcp.reduce_loop_load_step + sizeof(float) * offt];
+            + u1 * jcp.reduce_loop_load_step + sizeof(float) * offt + n * 4 * sizeof(float)];
     };
 
-    auto output_ptr = [=](int i, int j) {
+    auto output_ptr = [=](int i, int j, int n) {
         switch (jcp.prop_kind) {
         case backward_data:
             return ptr[aux_reg_output_data +
-                (i * jcp.is + j) * jcp.ic_block * sizeof(float)];
+                (i * jcp.is + j) * jcp.ic_block * sizeof(float) + n * 4 * sizeof(float)];
         case backward_weights:
             return ptr[aux_reg_output_data
                 + (i ? reg_output_stride * i : 0) // TODO: Xbyak should allow 0 scale
-                + sizeof(float) * jcp.oc_block * j];
+                + sizeof(float) * jcp.oc_block * j + n * 4 * sizeof(float)];
         default:
             return ptr[aux_reg_output_data +
-                (i * jcp.os + j) * jcp.oc_block * sizeof(float)];
+                (i * jcp.os + j) * jcp.oc_block * sizeof(float) + n*4*sizeof(float)];
         }
     };
 
@@ -154,23 +153,33 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
             jz(init_zero);
 
             for (int i = 0; i < load_loop_blk; i++)
-                for (int j = 0; j < ur; ++j)
-                    vmovups(vreg_accum(i, j), bias_ptr(i));
+                for (int j = 0; j < ur; ++j) {
+                    movups(reg_accum(i, j, 0), bias_ptr(i, 0));
+                    movups(reg_accum(i, j, 1), bias_ptr(i, 1));
+                }
             jmp(init_done);
         }
 
         L(init_zero);
         for (int i = 0; i < load_loop_blk; ++i)
             for (int j = 0; j < ur; ++j) {
-                auto r = vreg_accum(i, j);
-                vxorps(r, r, r);
+                auto r0 = reg_accum(i, j, 0);
+                auto r1 = reg_accum(i, j, 1);
+                xorps(r0, r0);
+                xorps(r1, r1);
             }
 
         L(init_done);
-        for (int i = 0; i < load_loop_blk; ++i)
-            vmovups(vreg_load(i), load_ptr(0, i));
-        vbroadcastss(vreg_bcast, bcast_ptr(0, 0));
-    };
+
+        // load weights
+        for (int i = 0; i < load_loop_blk; ++i) {
+            movups(reg_load(i, 0), load_ptr(0, i, 0));
+            movups(reg_load(i, 1), load_ptr(0, i, 1));
+        }
+
+        movss(reg_bcast, bcast_ptr(0, 0));
+        shufps(reg_bcast, reg_bcast, 0);
+    }; // init()
 
     auto store = [=]() {
         jit_tagged_label store_done(
@@ -182,8 +191,10 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
         jnz(store_noadd, T_NEAR);
         for (int j = 0; j < ur; ++j)
             for (int i = 0; i < load_loop_blk; ++i) {
-                auto r = vreg_accum(i, j);
-                vaddps(r, r, output_ptr(i, j));
+                auto r0 = reg_accum(i, j, 0);
+                auto r1 = reg_accum(i, j, 1);
+                addps(r0, output_ptr(i, j, 0));
+                addps(r1, output_ptr(i, j, 1));
             }
 
         L(store_noadd);
@@ -196,14 +207,19 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
             test(reg_reduce_pos_flag, REDUCE_FLAG_LAST);
             jz(store_norelu, T_NEAR);
 
-            Ymm vzero = ymm15, vmask = ymm14;
-            vxorps(vzero, vzero, vzero);
+            Xmm mask0 = xmm13;
+            Xmm mask1 = xmm14;
             for (int j = 0; j < ur; ++j)
                 for (int i = 0; i < load_loop_blk; ++i) {
-                    vcmpgtps(vmask, vreg_accum(i, j), vzero);
-                    vblendvps(vreg_accum(i, j),
-                            vzero, vreg_accum(i, j), vmask);
-                    vmovups(output_ptr(i, j), vreg_accum(i, j));
+                    xorps(mask0, mask0);
+                    xorps(mask1, mask1);
+                    const unsigned char _cmp_le_os = 2;
+                    cmpps(mask0, reg_accum(i, j, 0), _cmp_le_os);
+                    cmpps(mask1, reg_accum(i, j, 1), _cmp_le_os);
+                    blendvps(reg_accum(i, j, 0), mask0);
+                    blendvps(reg_accum(i, j, 1), mask1);
+                    movups(output_ptr(i, j, 0), reg_accum(i, j, 0));
+                    movups(output_ptr(i, j, 1), reg_accum(i, j, 1));
                 }
 
             jmp(store_done, T_NEAR);
@@ -212,7 +228,8 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
 
         for (int j = 0; j < ur; ++j)
             for (int i = 0; i < load_loop_blk; ++i) {
-                vmovups(output_ptr(i, j), vreg_accum(i, j));
+                movups(output_ptr(i, j, 0), reg_accum(i, j, 0));
+                movups(output_ptr(i, j, 1), reg_accum(i, j, 1));
             }
 
         L(store_done);
@@ -222,17 +239,26 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
         for (int u = 0; u < jcp.reduce_loop_unroll; ++u) {
             for (int j = 0; j < ur; ++j) {
                 for (int i = 0; i < load_loop_blk; ++i) {
-                    vfmadd231ps(vreg_accum(i, j), vreg_load(i), vreg_bcast);
-                    if (j == ur - 1 && !(last_block
-                                && u == jcp.reduce_loop_unroll - 1))
-                        vmovups(vreg_load(i), load_ptr(u + 1, i));
+                    mulps(reg_load(i, 0), reg_bcast);
+                    mulps(reg_load(i, 1), reg_bcast);
+                    addps(reg_accum(i, j, 0), reg_load(i, 0));
+                    addps(reg_accum(i, j, 1), reg_load(i, 1));
+
+                    if (j == ur - 1 && !(last_block && u == jcp.reduce_loop_unroll - 1)) {
+                        movups(reg_load(i, 0), load_ptr(u + 1, i, 0));
+                        movups(reg_load(i, 1), load_ptr(u + 1, i, 1));
+                    }
                 }
-                if (j < ur - 1)
-                    vbroadcastss(vreg_bcast, bcast_ptr(u, j + 1));
+                if (j < ur - 1) {
+                    movss(reg_bcast, bcast_ptr(u, j + 1));
+                    shufps(reg_bcast, reg_bcast, 0);
+                }
+            } // for ur
+            if (!last_block || u < jcp.reduce_loop_unroll - 1) {
+                movss(reg_bcast, bcast_ptr(u + 1, 0));
+                shufps(reg_bcast, reg_bcast, 0);
             }
-            if (!last_block || u < jcp.reduce_loop_unroll - 1)
-                vbroadcastss(vreg_bcast, bcast_ptr(u + 1, 0));
-        }
+        } // for reduce_loop_unroll
     };
 
     jit_tagged_label reduce_loop("reduce_loop", load_loop_tag, bcast_loop_tag);
@@ -260,9 +286,9 @@ void jit_avx2_1x1_conv_kernel_f32::reduce_loop(int load_loop_blk, int ur,
     fma_block(true);
 
     store();
-}
+} // reduce_loop()
 
-void jit_avx2_1x1_conv_kernel_f32::diff_bias_loop(int load_loop_blk,
+void jit_sse42_1x1_conv_kernel_f32::diff_bias_loop(int load_loop_blk,
         char load_loop_tag)
 {
     if (!jcp.with_bias || jcp.prop_kind != backward_weights)
@@ -273,16 +299,16 @@ void jit_avx2_1x1_conv_kernel_f32::diff_bias_loop(int load_loop_blk,
     jit_tagged_label diff_bias_init_out("diff_bias_init_out", load_loop_tag);
     jit_tagged_label diff_bias_load("diff_bias_load", load_loop_tag);
 
-    auto diff_bias_ptr = [=](int i) {
-        return ptr[reg_diff_bias_data + i * jcp.oc_block * sizeof(float)];
+    auto diff_bias_ptr = [=](int i, int n) {
+        return ptr[reg_diff_bias_data + i * jcp.oc_block * sizeof(float)+ 4*n*sizeof(float)];
     };
 
-    auto load_ptr = [=](int u, int i) {
+    auto load_ptr = [=](int u, int i, int n) {
         return ptr[aux_reg_load_data
-            + (i * jcp.os + u) * jcp.oc_block * sizeof(float)];
+            + (i * jcp.os + u) * jcp.oc_block * sizeof(float) + 4*n*sizeof(float)];
     };
 
-    auto diff_bias_reg = [=](int i) { return Ymm(i); };
+    auto diff_bias_reg = [=](int i, int n) { return Xmm(2*i + n); };
 
     mov(reg_diff_bias_data, ptr[rsp + reg_diff_bias_data_stack_offt]);
     cmp(reg_diff_bias_data, 0);
@@ -292,37 +318,46 @@ void jit_avx2_1x1_conv_kernel_f32::diff_bias_loop(int load_loop_blk,
     jz(diff_bias_load, T_NEAR);
 
     for (int i = 0; i < load_loop_blk; ++i) {
-        auto r = diff_bias_reg(i);
-        vxorps(r, r, r);
+        auto r0 = diff_bias_reg(i, 0);
+        auto r1 = diff_bias_reg(i, 1);
+        xorps(r0, r0);
+        xorps(r1, r1);
     }
     jmp(diff_bias_init_out, T_NEAR);
 
     L(diff_bias_load);
-    for (int i = 0; i < load_loop_blk; ++i)
-        vmovups(diff_bias_reg(i), diff_bias_ptr(i));
+    for (int i = 0; i < load_loop_blk; ++i) {
+        movups(diff_bias_reg(i, 0), diff_bias_ptr(i, 0));
+        movups(diff_bias_reg(i, 1), diff_bias_ptr(i, 1));
+    }
 
     L(diff_bias_init_out);
     mov(aux_reg_load_data, reg_load_data);
     mov(reduce_loop_iter, reg_reduce_loop_work);
     L(diff_bias_loop); {
         for(int u = 0; u < jcp.reduce_loop_unroll; ++u)
-            for (int i = 0; i < load_loop_blk; ++i)
-                vaddps(diff_bias_reg(i), diff_bias_reg(i), load_ptr(u, i));
+            for (int i = 0; i < load_loop_blk; ++i) {
+                addps(diff_bias_reg(i, 0), load_ptr(u, i, 0));
+                addps(diff_bias_reg(i, 1), load_ptr(u, i, 1));
+            }
         assert(jcp.reduce_dim % jcp.reduce_loop_unroll == 0);
         add(aux_reg_load_data, jcp.reduce_loop_load_step);
         sub(reduce_loop_iter, jcp.reduce_loop_unroll);
         jnz(diff_bias_loop, T_NEAR);
     }
 
-    for (int i = 0; i < load_loop_blk; i++)
-        vmovups(diff_bias_ptr(i), diff_bias_reg(i));
+    for (int i = 0; i < load_loop_blk; i++) {
+        movups(diff_bias_ptr(i, 0), diff_bias_reg(i, 0));
+        movups(diff_bias_ptr(i, 1), diff_bias_reg(i, 1));
+    }
+
     add(reg_diff_bias_data, load_loop_blk * jcp.oc_block * sizeof(float));
     mov(ptr[rsp + reg_diff_bias_data_stack_offt], reg_diff_bias_data);
 
     L(diff_bias_loop_out);
 }
 
-void jit_avx2_1x1_conv_kernel_f32::generate()
+void jit_sse42_1x1_conv_kernel_f32::generate()
 {
     preamble();
 
@@ -412,17 +447,18 @@ void jit_avx2_1x1_conv_kernel_f32::generate()
     L(load_loop_blk_end);
 
     if (jcp.with_bias && jcp.prop_kind == backward_weights)
-        add(rsp, 8);
+        add(rsp, stack_space_needed);
 
     postamble();
 }
 
-status_t jit_avx2_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
+status_t jit_sse42_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
         const convolution_desc_t &cd, const memory_desc_wrapper &src_d,
         const memory_desc_wrapper &weights_d, const memory_desc_wrapper &dst_d,
         bool with_relu, double relu_negative_slope)
 {
-    if (!mayiuse(avx2)) return status::unimplemented;
+    if (!mayiuse(sse42))
+        return status::unimplemented;
 
     // TODO (Roma): this code is duplicated from the generic kernel; maybe the
     // configuration struct could do some stuff below
@@ -473,7 +509,7 @@ status_t jit_avx2_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
         && dst_d.format() == nChw8c;
     if (!args_ok) return status::unimplemented;
 
-    const int simd_w = 8;
+    const int simd_w = 4;
 
     args_ok = true
         && jcp.oc % simd_w == 0 && jcp.ic % simd_w == 0
@@ -482,9 +518,9 @@ status_t jit_avx2_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
         && jcp.kh == 1 && jcp.kw == 1;
     if (!args_ok) return status::unimplemented;
 
-    jcp.ic_block = jcp.oc_block = simd_w;
+    jcp.ic_block = jcp.oc_block = simd_w*2;
 
-    jcp.ur = 4;
+    jcp.ur = 1;
 
     int load_blocking{ 0 };
     int load_blocking_max{ 0 };

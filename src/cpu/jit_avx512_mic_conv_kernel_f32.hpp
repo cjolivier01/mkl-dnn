@@ -65,6 +65,7 @@ private:
     reg64_t reg_bias = rdx;
 
     reg64_t reg_kj = rax;
+    reg64_t reg_relu_ns = rax;
     reg64_t reg_oi = rbx;
     reg64_t reg_kh = abi_not_param1;
 
@@ -82,10 +83,12 @@ private:
     reg64_t aux1_reg_inp = rbx;
     reg64_t aux_reg_out = abi_not_param1;
 
+    Xbyak::Zmm zmm_relu_ns = Xbyak::Zmm(30);
+    Xbyak::Zmm zmm_zero = Xbyak::Zmm(31);
+
     inline void prepare_output(int ur_w);
-    inline void store_output(int ur_w, char pad_label);
-    inline int compute_loop(int ur_w, int pad_l, int pad_r,
-            const char *kh_label, char pad_label);
+    inline void store_output(int ur_w);
+    inline int compute_loop(int ur_w, int pad_l, int pad_r);
 
     void generate();
 };

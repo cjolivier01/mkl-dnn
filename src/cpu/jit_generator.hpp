@@ -32,17 +32,25 @@ namespace impl {
 namespace cpu {
 
 typedef enum {
+    sse42,
     avx2,
     avx512_mic,
 } cpu_isa_t;
 
 template <cpu_isa_t> struct cpu_isa_trait {}; /* ::vlen -> 32 (for avx2) */
 
+template <> struct cpu_isa_trait<sse42> {
+    static constexpr int vlen_shift = 4;
+    static constexpr int vlen = 16;
+    static constexpr int n_vregs = 16;
+};
 template <> struct cpu_isa_trait<avx2> {
+    static constexpr int vlen_shift = 5;
     static constexpr int vlen = 32;
     static constexpr int n_vregs = 16;
 };
 template <> struct cpu_isa_trait<avx512_mic> {
+    static constexpr int vlen_shift = 6;
     static constexpr int vlen = 64;
     static constexpr int n_vregs = 32;
 };
@@ -110,6 +118,8 @@ static inline bool mayiuse(const cpu_isa_t cpu_isa) {
     static Cpu cpu;
 
     switch (cpu_isa) {
+    case sse42:
+        return cpu.has(Cpu::tSSE42);
     case avx2:
         return cpu.has(Cpu::tAVX2);
     case avx512_mic:
@@ -230,7 +240,7 @@ protected:
 public:
     jit_generator(
         void *code_ptr = nullptr,
-        size_t code_size = 32 * 1024 // size of a typical IC$
+        size_t code_size = 128 * 1024 // size of a typical IC$
         ) : Xbyak::CodeGenerator(code_size, code_ptr)
     {
     }
